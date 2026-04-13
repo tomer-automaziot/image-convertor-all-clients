@@ -14,7 +14,7 @@ app = FastAPI()
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-BUCKET = "product-images"
+BUCKET = os.environ.get("BUCKET_NAME", "product-images")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
