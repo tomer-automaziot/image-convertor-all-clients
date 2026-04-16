@@ -132,6 +132,105 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/process-project-upload")
+async def process_project_upload(request: Request):
+    """
+    Process a file uploaded to Supabase storage for a project.
+    Called directly by Supabase webhook on storage.objects INSERT.
+
+    Supabase webhook payload contains:
+    {
+        "record": {
+            "bucket_id": "media",
+            "name": "project-uuid/filename.jpg",   # folder = project id
+            "metadata": { "mimetype": "image/jpeg" }
+        }
+    }
+
+    Flow:
+    1. Parse project_id and filename from the storage path
+    2. Download the uploaded file
+    3. Convert image to JPEG or video to MP4
+    4. Upload converted file back to bucket (replace original)
+    5. Update photos[] or videos[] array in projects table
+    """
+    if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
+        return Response(status_code=401, content="Unauthorized")
+
+    body = await request.json()
+    record = body.get("record") or body
+
+    # Parse path: "project-uuid/filename.ext"
+    name = record.get("name", "")
+    bucket_id = record.get("bucket_id", BUCKET)
+    mime_type = ""
+    metadata = record.get("metadata") or {}
+    if isinstance(metadata, dict):
+        mime_type = metadata.get("mimetype") or metadata.get("contentType") or ""
+
+    parts = name.split("/")
+    if len(parts) < 2:
+        return {"success": False, "error": "Invalid path format. Expected: project_id/filename"}
+
+    project_id = parts[0]
+    filename = "/".join(parts[1:])
+    base_name = filename.rsplit(".", 1)[0]
+
+    is_image = mime_type.startswith("image/")
+    is_video = mime_type.startswith("video/")
+
+    if not is_image and not is_video:
+        return {"success": True, "message": "File is not an image or video, skipped", "path": name}
+
+    # Build public URL of uploaded file
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_id}/{name}"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            raw_bytes, content_type = await download_file(client, public_url)
+
+        if is_image:
+            converted, ext, mime = convert_image(raw_bytes, public_url, content_type)
+            storage_path = f"{project_id}/{base_name}{ext}"
+            final_url = upload_image(storage_path, converted, mime)
+            col = "photos"
+        else:
+            converted = convert_video(raw_bytes)
+            storage_path = f"{project_id}/{base_name}.mp4"
+            final_url = upload_image(storage_path, converted, "video/mp4")
+            col = "videos"
+
+        # Fetch current array from projects table
+        resp = supabase.table("projects").select(col).eq("id", project_id).single().execute()
+        if not resp.data:
+            return {"success": False, "error": f"Project {project_id} not found in projects table"}
+
+        current = resp.data.get(col) or []
+
+        # Replace old URL or append new one
+        old_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_id}/{name}"
+        if old_url in current:
+            updated = [final_url if u == old_url else u for u in current]
+        elif final_url not in current:
+            updated = current + [final_url]
+        else:
+            updated = current
+
+        supabase.table("projects").update({col: updated}).eq("id", project_id).execute()
+
+        return {
+            "success": True,
+            "project_id": project_id,
+            "column": col,
+            "original_path": name,
+            "converted_path": storage_path,
+            "public_url": final_url
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e), "path": name}
+
+
 @app.post("/convert-video")
 async def convert_video_endpoint(request: Request):
     """
